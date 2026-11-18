@@ -2,7 +2,7 @@
 
 **Open-core vector search and multi-vector CPU reranking engine built in Rust for S3 and object storage.**
 
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/ospreydb/ospreydb/blob/main/LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/ospreydb/osprey-engine/blob/main/LICENSE)
 [![Website](https://img.shields.io/badge/docs-ospreydb.dev-09090B)](https://ospreydb.dev)
 [![Crates.io](https://img.shields.io/crates/v/osprey-cli?label=crates.io)](https://crates.io/crates/osprey-cli)
 
@@ -15,7 +15,7 @@ Conventional vector databases duplicate Parquet data lakes and media embeddings 
 **OspreyDB decouples routing codes from storage slabs across three 64-byte cache-line aligned files:**
 
 1. **`.osi` (RAM / `mmap`)** — 1-bit FWHT-rotated `RaBitQ` sign codes + TSP-ordered `f16` centroids + `RoaringBitmap` tombstones, scanned linearly with `AVX-512 VPOPCNTDQ`, `AVX2`, or `ARM64 NEON`. Prunes >99% of vectors locally without network I/O.
-2. **`.osv` (S3 / MinIO / Disk)** — Zstd-compressed ~16 KiB minipages ordered by TSP cluster locality (`doc_id` zone maps, exact `f16` vectors, JSON payloads). Coalesced at query time by **`WaRP`** (1D Dynamic Programming `< 0.5 ms`) into a single parallel HTTP/2 `get_ranges` round-trip.
+2. **`.osv` (S3 / MinIO / Disk)** — Zstd-compressed ~16 KiB minipages ordered by TSP cluster locality (`doc_id` zone maps, exact `f16` vectors, JSON payloads). Coalesced at query time via **DP range coalescing** (1D Dynamic Programming `< 0.5 ms`) into a single parallel HTTP/2 `get_ranges` round-trip.
 3. **`.osr` (CPU `LUT-Rank`)** — 64-byte/token nested-lattice store (`2 × 4-bit` layers, `gamma = 0.28`) for ColBERT/ColPali `MaxSim` reranking on commodity CPUs using 16-entry `int8` LUTs (`< 8 µs` synthesis) and `vpshufb`/`vtbl` register shuffles—no GPUs required.
 
 ---
@@ -24,12 +24,13 @@ Conventional vector databases duplicate Parquet data lakes and media embeddings 
 
 | Repository | Purpose | Stack / Notes |
 | :--- | :--- | :--- |
-| [`ospreydb/ospreydb`](https://github.com/ospreydb/ospreydb) | Core engine (`osprey-core`, `osprey-simd`, `osprey-storage`) and static CLI (`osprey`) | Rust, Apache-2.0, `memmap2`, `object_store`, Zstd |
+| [`ospreydb/osprey-engine`](https://github.com/ospreydb/osprey-engine) | Open-core engine (`osprey-core`, `osprey-simd`, `osprey-storage`) and static CLI (`osprey-engine`) | Rust, Apache-2.0, `memmap2`, `object_store`, Zstd |
+| [`ospreydb/ospreydb`](https://github.com/ospreydb/ospreydb) | Commercial database server daemon (`osprey`), WAL, LSM delta buffer, CoW compactor, REST & Arrow Flight | Rust, consumes `osprey-core` / `osprey-storage` public traits |
 | [`ospreydb/benchmarks`](https://github.com/ospreydb/benchmarks) | Reproducible benchmark suite against Qdrant (`FP32` & `1-bit BQ`), `pgvector`, and ColBERTv2 | Controlled recall-matched harness, MinIO `tc netem 15ms`, `perf` |
-| [`ospreydb/homebrew-tap`](https://github.com/ospreydb/homebrew-tap) | Official Homebrew tap for macOS & Linux (`brew install ospreydb/tap/osprey`) | Automated SHA-256 updates on tagged releases |
+| [`ospreydb/homebrew-tap`](https://github.com/ospreydb/homebrew-tap) | Official Homebrew tap for macOS & Linux (`brew install ospreydb/tap/osprey` & `osprey-engine`) | Automated SHA-256 updates on tagged releases |
 | [`ospreydb/site`](https://github.com/ospreydb/site) | Website, architecture docs, AWS/S3 TCO estimator, and offline Ed25519 licensing webhook | Astro, Cloudflare Pages, `ospreydb.dev` |
 
-> Note: Commercial production extensions (`WAL`, `LSM Delta Buffer`, `CoW` compactor, `manifest.json` S3 CAS coordination, Qdrant REST `:6333`, `/v1/embeddings`, `/v1/rerank`, and Apache Arrow Flight `:8815`) live in the private `osprey-pro` module, consuming `osprey-core` and `osprey-storage` exclusively through public traits.
+> Note: Commercial production extensions (`WAL`, `LSM Delta Buffer`, `CoW` compactor, `manifest.json` S3 CAS coordination, Qdrant REST `:6333`, `/v1/embeddings`, `/v1/rerank`, and Apache Arrow Flight `:8815`) live in the `osprey` daemon (`ospreydb/ospreydb`), consuming `osprey-core` and `osprey-storage` exclusively through public traits.
 
 ---
 
@@ -58,7 +59,7 @@ All numbers below come directly from raw CSV artifacts in [`ospreydb/benchmarks/
 
 - **CPU `LUT-Rank` (`MS MARCO`, 200 candidates/query):** **`0.329 ms` P50**, **`2,849.1 QPS`** (fastest CPU engine vs. PyTorch CPU `0.416 ms` / `2,300.7 QPS`, ONNX Runtime `0.476 ms`, NumPy BLAS `0.801 ms`), **`97.2 MiB`** `.osr` index (**7.9× smaller** than ColBERTv2 `768.43 MiB`), `0.7768` vs. `0.7876` `NDCG@10` (`98.6%` retention).
 - **BEIR SciFact / FiQA (`LUT-Rank`):** `0.505 ms` / `0.519 ms` P50, `2,121.7` / `2,005.7 QPS`, `10.24 MiB` / `112.82 MiB` index (`7.9×` smaller than ColBERTv2).
-- **`WaRP` S3 Coalescing (`MinIO + tc netem 15ms`, `17.03 ms` RTT on Cohere 768d):** At `R@10 = 0.960` (`nprobe=32, refine_m=200`), coalesces `158.6` candidate `.osv` pages into **`18.5` S3 `Range-GET` requests** (**8.6× fewer requests**, up to **49.3×** at `nprobe=4, refine_m=300`) while keeping `VmHWM` under `103 MiB`.
+- **DP Range S3 Coalescing (`MinIO + tc netem 15ms`, `17.03 ms` RTT on Cohere 768d):** At `R@10 = 0.960` (`nprobe=32, refine_m=200`), coalesces `158.6` candidate `.osv` pages into **`18.5` S3 `Range-GET` requests** (**8.6× fewer requests**, up to **49.3×** at `nprobe=4, refine_m=300`) while keeping `VmHWM` under `103 MiB`.
 
 ---
 
@@ -66,20 +67,20 @@ All numbers below come directly from raw CSV artifacts in [`ospreydb/benchmarks/
 
 | Tier | License / Scope | Key Highlights |
 | :--- | :--- | :--- |
-| **`osprey` CLI & Core Crates** | **Apache-2.0** (`ospreydb/ospreydb`) | Full SIMD math (`FWHT`, `1-Bit SuperKMeans`, `RaBitQ`, `WaRP`, `LUT-Rank`), Parquet/JSONL/NPY ingestion, S3/local search, tombstone deletes, and TCO benchmarking (`osprey bench`). |
-| **`osprey-pro` Single-Node Free** | **Free forever (no key required)** | Full resident daemon, CRC32/fsync WAL, LSM delta buffer, HTTP `:6333`, and `/v1/embeddings` up to **5,000,000 vectors** on a single node (reads remain online above 5M; Docker Desktop style). |
-| **`osprey-pro` Pro / Scale** | **Commercial (100% BYOC)** | Unlimited vectors, multi-node S3 `manifest.json` CAS sync, background CoW compaction, `/v1/rerank`, and Arrow Flight `:8815`. **$360/yr** launch offer (`$49/mo`) up to 3 nodes. Verified **100% offline via `Ed25519` (`< 50 µs`) — zero phone-home, zero telemetry.** |
+| **`osprey-engine` CLI & Core Crates** | **Apache-2.0** (`ospreydb/osprey-engine`) | Full SIMD math (`FWHT`, `1-Bit Binary K-Means`, `RaBitQ`, DP range coalescing, `LUT-Rank`), Parquet/JSONL/NPY ingestion, S3/local search, tombstone deletes, and TCO benchmarking (`osprey-engine bench`). |
+| **`osprey` Single-Node Free** | **Free forever (no key required)** | Full resident daemon, CRC32/fsync WAL, LSM delta buffer, HTTP `:6333`, and `/v1/embeddings` up to **5,000,000 vectors** on a single node (reads remain online above 5M; Docker Desktop style). |
+| **`osprey` Pro / Scale** | **Commercial (100% BYOC)** | Unlimited vectors, multi-node S3 `manifest.json` CAS sync, background CoW compaction, `/v1/rerank`, and Arrow Flight `:8815`. **$360/yr** launch offer (`$49/mo`) up to 3 nodes. Verified **100% offline via `Ed25519` (`< 50 µs`) — zero phone-home, zero telemetry.** |
 
 ---
 
 ## Quickstart
 
 ```bash
-curl -fsSL https://ospreydb.dev/install.sh | sh
-# or: brew install ospreydb/tap/osprey | cargo install osprey-cli
+curl -fsSL https://ospreydb.dev/install-engine.sh | sh
+# or: brew install ospreydb/tap/osprey-engine | cargo install osprey-cli
 
-osprey doctor
-osprey bench --with-lutrank --project-vectors 50000000 --project-dim 1536 --project-qpm 10000000
+osprey-engine doctor
+osprey-engine bench --with-lutrank --project-vectors 50000000 --project-dim 1536 --project-qpm 10000000
 ```
 
 [ospreydb.dev](https://ospreydb.dev) · [Architecture](https://ospreydb.dev/architecture) · [Benchmarks](https://ospreydb.dev/benchmarks) · [Pricing](https://ospreydb.dev/pricing)
